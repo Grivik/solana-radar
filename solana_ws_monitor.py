@@ -4,6 +4,7 @@ import asyncio
 import json
 import csv
 import time
+import base64
 import websockets
 import ssl
 import aiohttp
@@ -25,6 +26,7 @@ FULL_AUTO = os.getenv("FULL_AUTO", "False").lower() == "true"  # полност�
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10.0"))   # тейк-профит в процентах
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "10.0"))       # стоп-лосс в процентах
 MAX_BUY_SOL = float(os.getenv("MAX_BUY_SOL", "0.5"))  # максимальная сумма одной покупки в SOL
+TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper" или "live"
 
 # Лимиты позиций и тайм-аут удержания
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
@@ -225,8 +227,8 @@ async def get_jupiter_quote(session, input_mint, output_mint, amount_sol):
         "outputMint": output_mint,        # адрес токена
         "amount": int(amount_sol * 1e9),  # переводим SOL в лампорты
         "slippageBps": int(MAX_SLIPPAGE_PCT * 100),  # из .env, в базисных пунктах
-        "onlyDirectRoutes": False,
-        "asLegacyTransaction": True
+        "onlyDirectRoutes": "false",
+        "asLegacyTransaction": "true"
     }
     try:
         async with session.get(url, params=params, timeout=5) as resp:
@@ -241,8 +243,8 @@ async def get_jupiter_quote(session, input_mint, output_mint, amount_sol):
 
 async def execute_jupiter_swap(session, token_address, token_symbol, change_sol):
     """
-    Выполняет реальный своп SOL -> токен через Jupiter API (пока заглушка).
-    В боевом режиме будет подписывать и отправлять транзакцию.
+    Выполняет реальный своп SOL -> токен через Jupiter API.
+    Возвращает True при успехе, False при ошибке.
     """
     # Загружаем приватный ключ
     private_key_str = os.getenv("SOLANA_PRIVATE_KEY", "")
@@ -261,20 +263,73 @@ async def execute_jupiter_swap(session, token_address, token_symbol, change_sol)
         print(f"[JUPITER] Не удалось получить котировку для {token_symbol}")
         return False
 
-    # Выводим информацию (пока без отправки)
+    # Выводим информацию о котировке
     print(f"[JUPITER] Котировка для {token_symbol}:")
     print(f"  Вход: {change_sol:.4f} SOL")
-    print(f"  Выход: {int(quote.get('outAmount', 0)) / 1e9:.6f} токенов")
-    print(f"  Минимальный выход (с учётом slippage): {int(quote.get('otherAmountThreshold', 0)) / 1e9:.6f} токенов")
+    out_amount = int(quote.get('outAmount', 0)) / 1e9
+    print(f"  Выход: {out_amount:.6f} токенов")
     print(f"  Price Impact: {quote.get('priceImpactPct', 'N/A')}%")
 
-    # ЗАГЛУШКА: реальная транзакция не отправляется
-    # В боевом режиме здесь будет:
-    #   - подписание транзакции приватным ключом
-    #   - отправка через sendTransaction
-    print(f"[JUPITER] Своп {token_symbol} выполнен (заглушка).")
-    return True
+    # Получаем готовую транзакцию от Jupiter (swap transaction)
+    tx_payload = {
+        "quoteResponse": quote,
+        "userPublicKey": "DF2RCLMsyp3maQyjDrpJtCDGvX2R8aqEmGyEZVsKXLqB",
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+        "prioritizationFeeLamports": 100000  # приоритетная комиссия
+    }
+    try:
+        async with session.post("https://quote-api.jup.ag/v6/swap", json=tx_payload, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"[JUPITER] Ошибка получения транзакции: статус {resp.status}")
+                return False
+            swap_data = await resp.json()
+            raw_tx = swap_data.get('swapTransaction')
+            if not raw_tx:
+                print("[JUPITER] Пустая транзакция в ответе swap")
+                return False
+    except Exception as e:
+        print(f"[JUPITER] Ошибка запроса swap: {e}")
+        return False
 
+    # Подписываем транзакцию
+    try:
+        from solders.keypair import Keypair
+        from solders.transaction import VersionedTransaction
+        from base64 import b64decode
+
+        keypair = Keypair.from_base58_string(private_key_str)
+        tx_bytes = b64decode(raw_tx)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        tx.sign([keypair])
+        signed_tx = tx
+    except Exception as e:
+        print(f"[JUPITER] Ошибка подписи транзакции: {e}")
+        return False
+
+    # Отправляем транзакцию в сеть
+    try:
+        send_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                base64.b64encode(bytes(signed_tx)).decode('utf-8'),
+                {"encoding": "base64", "maxRetries": 3}
+            ]
+        }
+        async with session.post(HTTP_URL, json=send_payload, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"[JUPITER] Ошибка отправки транзакции: статус {resp.status}")
+                return False
+            result = await resp.json()
+            tx_id = result.get('result', 'N/A')
+            print(f"[JUPITER] Транзакция отправлена! TX ID: {tx_id}")
+            print(f"[JUPITER] Проверить: https://solscan.io/tx/{tx_id}")
+            return True
+    except Exception as e:
+        print(f"[JUPITER] Ошибка отправки транзакции: {e}")
+        return False
 
 async def fetch_token_info(session, token_address):
     """
@@ -671,9 +726,41 @@ async def monitor(ws, session):
                     if virtual_balance < change_sol:
                         print(f"[WARNING] Недостаточно виртуального баланса ({virtual_balance:.4f} SOL). Покупка невозможна.")
                         continue
-                    if change_sol > MAX_BUY_SOL:
+                    if round(change_sol, 6) > MAX_BUY_SOL:
                         print(f"[WARNING] Сумма свопа {change_sol:.4f} SOL превышает лимит {MAX_BUY_SOL} SOL. Покупка пропущена.")
                         continue
+                    # Если боевой режим — выполняем реальный своп
+                    if TRADING_MODE == "live":
+                        success = await execute_jupiter_swap(session, token_address, token_info['symbol'], change_sol)
+                        if success:
+                            print(f">>> [LIVE] Реальная покупка: {token_info['symbol']} на {change_sol:.4f} SOL")
+                            # Обновляем виртуальный баланс для логирования (зеркалируем реальную сделку)
+                            virtual_balance -= change_sol
+                            fee_sol = change_sol * (SIM_FEE_PCT / 100.0)
+                            virtual_balance -= fee_sol
+                            save_balance(virtual_balance)
+                            portfolio[token_address] = {
+                                'symbol': token_info['symbol'],
+                                'name': token_info['name'],
+                                'amount': change_sol,
+                                'buy_price': token_info['price_per_token'],
+                                'entry_time': time.time()
+                            }
+                            save_portfolio(portfolio)
+                            # Запись сделки в CSV
+                            sim_trade = {
+                                'timestamp': asyncio.get_event_loop().time(),
+                                'token_address': token_address,
+                                'symbol': token_info['symbol'],
+                                'name': token_info['name'],
+                                'sol_amount': change_sol,
+                                'price_per_token': token_info['price_per_token'],
+                                'liquidity_usd': liquidity
+                            }
+                            await write_sim_trade(sim_trade, virtual_balance, side='BUY', pnl_sol=0.0)
+                        else:
+                            print(f"[LIVE] Реальная покупка {token_info['symbol']} не удалась.")
+                        continue  # После реальной сделки переходим к следующему свопу
 
                     virtual_balance -= change_sol
                     # Списание комиссии симулятора
@@ -718,7 +805,7 @@ async def monitor(ws, session):
                         if virtual_balance < change_sol:
                             print(f"[WARNING] Недостаточно виртуального баланса ({virtual_balance:.4f} SOL). Сделка не записана.")
                         else:
-                            if change_sol > MAX_BUY_SOL:
+                            if round(change_sol, 6) > MAX_BUY_SOL:
                                 print(f"[WARNING] Сумма свопа {change_sol:.4f} SOL превышает лимит {MAX_BUY_SOL} SOL. Покупка пропущена.")
                                 continue
                             virtual_balance -= change_sol
@@ -839,7 +926,7 @@ async def main():
 
     print("=" * 60)
     print("   SOLANA REAL-TIME RADAR: AUTO-RECONNECT + FILTER ACTIVE   ")
-    print(f"   Порог суммы: {MIN_SWAP_AMOUNT_SOL} SOL")
+    print(f"   Порог суммы: {MIN_SWAP_AMOUNT_SOL} SOL, макс. вход: {MAX_BUY_SOL} SOL")
     print(f"   Порог ликвидности: ${MIN_LIQUIDITY_USD:,.2f}")
     print(f"   Стартовый виртуальный баланс: {virtual_balance:.4f} SOL")
     if FULL_AUTO:
