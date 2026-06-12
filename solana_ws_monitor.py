@@ -37,7 +37,7 @@ HARD_TIMEOUT_MINUTES = int(os.getenv("HARD_TIMEOUT_MINUTES", "30"))
 # Комиссии и проскальзывание
 SIM_FEE_PCT = float(os.getenv("SIM_FEE_PCT", "0.3"))          # комиссия симулятора в процентах
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "5.0")) # допустимое проскальзывание (пока не используется, для лога)
-
+PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "1000000"))  # приоритетная комиссия в лампортах
 SIM_TRADES_FILE = os.getenv("SIM_TRADES_FILE", "sim_trades.csv")  # путь к файлу симулятора сделок
 SIM_BALANCE_FILE = os.getenv("SIM_BALANCE_FILE", "sim_balance.txt")  # файл сохранения виртуального баланса
 SIM_PORTFOLIO_FILE = os.getenv("SIM_PORTFOLIO_FILE", "sim_portfolio.json")  # файл сохранения портфеля
@@ -215,23 +215,55 @@ async def fetch_tx_details(session, signature):
     except Exception as e:
         print(f"[ERROR] Не удалось получить детали TX {signature}: {e}")
     return None
+async def get_token_balance(session, token_address):
+    """
+    Возвращает реальный баланс токена на вашем кошельке в минимальных единицах.
+    Пример: для USDC вернёт 1030400 (1.0304 * 10^6).
+    """
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                "DF2RCLMsyp3maQyjDrpJtCDGvX2R8aqEmGyEZVsKXLqB",
+                {"mint": token_address},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        async with session.post(HTTP_URL, json=payload, timeout=5) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                accounts = data.get('result', {}).get('value', [])
+                if accounts:
+                    token_amount = accounts[0]['account']['data']['parsed']['info']['tokenAmount']
+                    amount_str = token_amount['amount']
+                    return int(amount_str)
+    except Exception as e:
+        print(f"[BALANCE] Ошибка получения баланса токена {token_address}: {e}")
+    return 0
 
 async def get_jupiter_quote(session, input_mint, output_mint, amount_sol):
     """
-    Получает котировку от Jupiter API для обмена SOL -> токен.
+    Получает котировку от Jupiter API (Swap API V2) для обмена SOL -> токен.
     Возвращает словарь с маршрутом обмена или None при ошибке.
     """
-    url = "https://quote-api.jup.ag/v6/quote"
+    url = "https://api.jup.ag/swap/v1/quote"
     params = {
-        "inputMint": input_mint,          # SOL
-        "outputMint": output_mint,        # адрес токена
-        "amount": int(amount_sol * 1e9),  # переводим SOL в лампорты
-        "slippageBps": int(MAX_SLIPPAGE_PCT * 100),  # из .env, в базисных пунктах
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": int(amount_sol * 1e9),
+        "slippageBps": int(MAX_SLIPPAGE_PCT * 100),
         "onlyDirectRoutes": "false",
         "asLegacyTransaction": "true"
     }
+    headers = {}
+    jupiter_key = os.getenv("JUPITER_API_KEY", "")
+    if jupiter_key:
+        headers["x-api-key"] = jupiter_key
+
     try:
-        async with session.get(url, params=params, timeout=5) as resp:
+        async with session.get(url, params=params, headers=headers, timeout=5) as resp:
             if resp.status == 200:
                 return await resp.json()
             else:
@@ -241,12 +273,12 @@ async def get_jupiter_quote(session, input_mint, output_mint, amount_sol):
         print(f"[JUPITER] Ошибка запроса quote: {e}")
         return None
 
+
 async def execute_jupiter_swap(session, token_address, token_symbol, change_sol):
     """
     Выполняет реальный своп SOL -> токен через Jupiter API.
-    Возвращает True при успехе, False при ошибке.
+    Отправляет транзакцию напрямую через aiohttp.
     """
-    # Загружаем приватный ключ
     private_key_str = os.getenv("SOLANA_PRIVATE_KEY", "")
     if not private_key_str:
         print("[JUPITER] Приватный ключ не задан. Своп не выполнен.")
@@ -255,7 +287,7 @@ async def execute_jupiter_swap(session, token_address, token_symbol, change_sol)
     # Получаем котировку
     quote = await get_jupiter_quote(
         session,
-        "So11111111111111111111111111111111111111112",  # mint адрес SOL
+        "So11111111111111111111111111111111111111112",
         token_address,
         change_sol
     )
@@ -263,23 +295,24 @@ async def execute_jupiter_swap(session, token_address, token_symbol, change_sol)
         print(f"[JUPITER] Не удалось получить котировку для {token_symbol}")
         return False
 
-    # Выводим информацию о котировке
     print(f"[JUPITER] Котировка для {token_symbol}:")
     print(f"  Вход: {change_sol:.4f} SOL")
     out_amount = int(quote.get('outAmount', 0)) / 1e9
     print(f"  Выход: {out_amount:.6f} токенов")
     print(f"  Price Impact: {quote.get('priceImpactPct', 'N/A')}%")
 
-    # Получаем готовую транзакцию от Jupiter (swap transaction)
+    # Запрашиваем готовую транзакцию у Jupiter
+    from solders.keypair import Keypair
+    keypair = Keypair.from_base58_string(private_key_str)
     tx_payload = {
         "quoteResponse": quote,
-        "userPublicKey": "DF2RCLMsyp3maQyjDrpJtCDGvX2R8aqEmGyEZVsKXLqB",
+        "userPublicKey": str(keypair.pubkey()),
         "wrapAndUnwrapSol": True,
         "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": 100000  # приоритетная комиссия
+        "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS
     }
     try:
-        async with session.post("https://quote-api.jup.ag/v6/swap", json=tx_payload, timeout=10) as resp:
+        async with session.post("https://api.jup.ag/swap/v1/swap", json=tx_payload, timeout=10) as resp:
             if resp.status != 200:
                 print(f"[JUPITER] Ошибка получения транзакции: статус {resp.status}")
                 return False
@@ -292,43 +325,171 @@ async def execute_jupiter_swap(session, token_address, token_symbol, change_sol)
         print(f"[JUPITER] Ошибка запроса swap: {e}")
         return False
 
-    # Подписываем транзакцию
+    # Подписываем и отправляем
     try:
-        from solders.keypair import Keypair
         from solders.transaction import VersionedTransaction
         from base64 import b64decode
+        import base64
 
-        keypair = Keypair.from_base58_string(private_key_str)
         tx_bytes = b64decode(raw_tx)
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        tx.sign([keypair])
-        signed_tx = tx
-    except Exception as e:
-        print(f"[JUPITER] Ошибка подписи транзакции: {e}")
-        return False
+        message = tx.message
 
-    # Отправляем транзакцию в сеть
-    try:
+        # Правильная подпись через конструктор (багфикс solders 0.27.1)
+        signature = keypair.sign_message(bytes(message))
+        signed_tx = VersionedTransaction(message, [keypair])
+
+        signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+
         send_payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
             "params": [
-                base64.b64encode(bytes(signed_tx)).decode('utf-8'),
-                {"encoding": "base64", "maxRetries": 3}
+                signed_tx_b64,
+                {"encoding": "base64", "preflightCommitment": "processed", "maxRetries": 5}
             ]
         }
-        async with session.post(HTTP_URL, json=send_payload, timeout=10) as resp:
-            if resp.status != 200:
-                print(f"[JUPITER] Ошибка отправки транзакции: статус {resp.status}")
-                return False
+        async with session.post(HTTP_URL, json=send_payload, timeout=15) as resp:
             result = await resp.json()
-            tx_id = result.get('result', 'N/A')
+            print(f"[DEBUG] Ответ Helius: {result}")
+
+            if "error" in result:
+                err = result["error"]
+                print(f"[HELIUS ERROR] Код: {err.get('code')} | {err.get('message')}")
+                return False
+
+            tx_id = result.get("result")
+            if not tx_id:
+                print(f"[JUPITER] Пустой TX ID: {result}")
+                return False
+
             print(f"[JUPITER] Транзакция отправлена! TX ID: {tx_id}")
             print(f"[JUPITER] Проверить: https://solscan.io/tx/{tx_id}")
             return True
+
     except Exception as e:
-        print(f"[JUPITER] Ошибка отправки транзакции: {e}")
+        print(f"[JUPITER] Ошибка при отправке: {e}")
+        return False
+async def execute_jupiter_sell(session, token_address, token_symbol, amount_sol):
+    """
+    Выполняет реальный своп токен -> SOL через Jupiter API.
+    """
+    private_key_str = os.getenv("SOLANA_PRIVATE_KEY", "")
+    if not private_key_str:
+        print("[JUPITER] Приватный ключ не задан. Продажа не выполнена.")
+        return False
+
+    # Автоматически получаем точный баланс токена
+    token_balance_units = await get_token_balance(session, token_address)
+    if token_balance_units <= 0:
+        print(f"[JUPITER] Нулевой баланс {token_symbol}, продажа невозможна.")
+        return False
+
+    print(f"[JUPITER] Баланс {token_symbol}: {token_balance_units} минимальных единиц")
+
+    # Прямой запрос котировки для продажи (токен -> SOL)
+    quote = None
+    try:
+        params = {
+            "inputMint": token_address,
+            "outputMint": "So11111111111111111111111111111111111111112",
+            "amount": token_balance_units,
+            "slippageBps": int(MAX_SLIPPAGE_PCT * 100),
+            "onlyDirectRoutes": "false",
+            "asLegacyTransaction": "true"
+        }
+        headers = {}
+        jupiter_key = os.getenv("JUPITER_API_KEY", "")
+        if jupiter_key:
+            headers["x-api-key"] = jupiter_key
+        async with session.get("https://api.jup.ag/swap/v1/quote", params=params, headers=headers, timeout=5) as resp:
+            if resp.status == 200:
+                quote = await resp.json()
+            else:
+                print(f"[JUPITER] Ошибка quote (продажа): статус {resp.status}")
+                return False
+    except Exception as e:
+        print(f"[JUPITER] Ошибка запроса quote (продажа): {e}")
+        return False
+
+    if not quote:
+        print(f"[JUPITER] Не удалось получить котировку для продажи {token_symbol}")
+        return False
+
+    print(f"[JUPITER] Котировка для продажи {token_symbol}:")
+    out_amount = int(quote.get('outAmount', 0)) / 1e9
+    print(f"  Выход: {out_amount:.6f} SOL")
+    print(f"  Price Impact: {quote.get('priceImpactPct', 'N/A')}%")
+
+    # Запрашиваем готовую транзакцию у Jupiter
+    from solders.keypair import Keypair
+    keypair = Keypair.from_base58_string(private_key_str)
+    tx_payload = {
+        "quoteResponse": quote,
+        "userPublicKey": str(keypair.pubkey()),
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+        "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS
+    }
+    try:
+        async with session.post("https://api.jup.ag/swap/v1/swap", json=tx_payload, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"[JUPITER] Ошибка получения транзакции продажи: статус {resp.status}")
+                return False
+            swap_data = await resp.json()
+            raw_tx = swap_data.get('swapTransaction')
+            if not raw_tx:
+                print("[JUPITER] Пустая транзакция в ответе swap (продажа)")
+                return False
+    except Exception as e:
+        print(f"[JUPITER] Ошибка запроса swap (продажа): {e}")
+        return False
+
+    # Подписываем и отправляем
+    try:
+        from solders.transaction import VersionedTransaction
+        from base64 import b64decode
+        import base64
+
+        tx_bytes = b64decode(raw_tx)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        message = tx.message
+
+        signature = keypair.sign_message(bytes(message))
+        signed_tx = VersionedTransaction(message, [keypair])
+
+        signed_tx_b64 = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+
+        send_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_b64,
+                {"encoding": "base64", "preflightCommitment": "processed", "maxRetries": 5}
+            ]
+        }
+        async with session.post(HTTP_URL, json=send_payload, timeout=15) as resp:
+            result = await resp.json()
+            print(f"[DEBUG] Ответ Helius (продажа): {result}")
+
+            if "error" in result:
+                err = result["error"]
+                print(f"[HELIUS ERROR] Код: {err.get('code')} | {err.get('message')}")
+                return False
+
+            tx_id = result.get("result")
+            if not tx_id:
+                print(f"[JUPITER] Пустой TX ID (продажа): {result}")
+                return False
+
+            print(f"[JUPITER] Продажа отправлена! TX ID: {tx_id}")
+            print(f"[JUPITER] Проверить: https://solscan.io/tx/{tx_id}")
+            return True
+
+    except Exception as e:
+        print(f"[JUPITER] Ошибка при отправке продажи: {e}")
         return False
 
 async def fetch_token_info(session, token_address):
@@ -464,7 +625,6 @@ async def write_sim_trade(trade_data, new_balance, side, pnl_sol):
     except Exception as e:
         print(f"[ERROR] Не удалось записать симуляцию сделки в CSV: {e}")
 
-
 async def check_hold_timeout(session):
     """
     Каскадный тайм-аут: проверяет позиции по трём уровням:
@@ -502,8 +662,7 @@ async def check_hold_timeout(session):
             amount = pos['amount']
             pnl_sol = amount * (price_change_pct / 100)
 
-            # Каскадная логика
-                        # Ступенчатый каскадный тайм-аут (строгие временные окна)
+            # Ступенчатый каскадный тайм-аут (строгие временные окна)
             if age_minutes >= HARD_TIMEOUT_MINUTES:
                 should_sell = True
                 reason = f"жёсткий тайм-аут ({HARD_TIMEOUT_MINUTES} мин)"
@@ -520,6 +679,15 @@ async def check_hold_timeout(session):
                 virtual_balance += amount + pnl_sol
                 save_balance(virtual_balance)
 
+                # Реальная продажа по тайм-ауту в боевом режиме
+                if TRADING_MODE == "live":
+                    sell_success = await execute_jupiter_sell(session, token_address, pos['symbol'], amount)
+                    if sell_success:
+                        now = datetime.datetime.now().strftime('%H:%M:%S')
+                        print(f"[{now}] >>> [LIVE] Реальная продажа (тайм-аут): {pos['symbol']}")
+                    else:
+                        print(f"[LIVE] Реальная продажа (тайм-аут) {pos['symbol']} не удалась.")
+
                 sim_trade = {
                     'timestamp': time.time(),
                     'token_address': token_address,
@@ -532,7 +700,8 @@ async def check_hold_timeout(session):
                 await write_sim_trade(sim_trade, virtual_balance, side='SELL', pnl_sol=pnl_sol)
 
                 emoji = "✅" if pnl_sol >= 0 else "❌"
-                print(f">>> [TIMEOUT] Принудительная продажа: {pos['symbol']}, "
+                now = datetime.datetime.now().strftime('%H:%M:%S')
+                print(f"[{now}] >>> [TIMEOUT] Принудительная продажа: {pos['symbol']}, "
                       f"удерживалась {age_minutes:.1f} мин, причина: {reason}, "
                       f"PnL: {pnl_sol:+.4f} SOL, Баланс: {virtual_balance:.4f} SOL {emoji}")
 
@@ -693,6 +862,13 @@ async def monitor(ws, session):
                         pnl_sol = amount * (price_change_pct / 100)
                         virtual_balance += amount + pnl_sol
                         save_balance(virtual_balance)
+                        # Реальная продажа в боевом режиме (TP/SL)
+                        if TRADING_MODE == "live":
+                            sell_success = await execute_jupiter_sell(session, token_address, token_info['symbol'], amount)
+                            if sell_success:
+                                print(f">>> [LIVE] Реальная продажа: {token_info['symbol']} на {amount:.4f} SOL")
+                            else:
+                                print(f"[LIVE] Реальная продажа {token_info['symbol']} не удалась.")
 
                         sim_trade = {
                             'timestamp': asyncio.get_event_loop().time(),
@@ -711,9 +887,6 @@ async def monitor(ws, session):
                         del portfolio[token_address]
                         save_portfolio(portfolio)  # сохраняем изменения
                         continue  # продажа выполнена, переходим к следующему свопу
-                    else:
-                        print(f"[INFO] Токен {token_info['symbol']} уже в портфеле, условия продажи не выполнены.")
-                        continue  # позиция открыта, не покупаем
 
                 # Если токена нет в портфеле – выполняем логику покупки
                 if FULL_AUTO:
@@ -733,7 +906,8 @@ async def monitor(ws, session):
                     if TRADING_MODE == "live":
                         success = await execute_jupiter_swap(session, token_address, token_info['symbol'], change_sol)
                         if success:
-                            print(f">>> [LIVE] Реальная покупка: {token_info['symbol']} на {change_sol:.4f} SOL")
+                            now = datetime.datetime.now().strftime('%H:%M:%S')
+                            print(f"[{now}] >>> [LIVE] Реальная покупка: {token_info['symbol']} на {change_sol:.4f} SOL")
                             # Обновляем виртуальный баланс для логирования (зеркалируем реальную сделку)
                             virtual_balance -= change_sol
                             fee_sol = change_sol * (SIM_FEE_PCT / 100.0)
@@ -938,22 +1112,6 @@ async def main():
     print(f"   Лимит открытых позиций: {MAX_OPEN_POSITIONS}, каскад: {CASCADE_TP_MINUTES}/{CASCADE_BE_MINUTES}/{HARD_TIMEOUT_MINUTES} мин")
     print("=" * 60)
 
-    # Автоматический запрос 2 SOL в Devnet через Helius
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "requestAirdrop",
-            "params": ["2ZPwwWt85geEwjdQtpzApZN6P6rzysVXRYFnvoMeBKN2", 2000000000]
-        }
-        async with aiohttp.ClientSession() as tmp_session:
-            async with tmp_session.post(HTTP_URL, json=payload) as resp:
-                if resp.status == 200:
-                    print("[OK] Запрос на пополнение Devnet кошелька отправлен!")
-                else:
-                    print("[INFO] Кран через API ответил статусом:", resp.status)
-    except Exception as e:
-        print("[WARNING] Не удалось запросить монеты автоматом:", e)
     async with aiohttp.ClientSession() as session:
         await connect_with_retry(session)
 
